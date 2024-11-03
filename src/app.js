@@ -2,10 +2,12 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const {sequelize} = require('./model')
 const {getProfile} = require('./middleware/getProfile')
+const {validateDateRange} = require('./middleware/validateDateRange')
 const app = express();
 app.use(bodyParser.json());
 app.set('sequelize', sequelize)
 app.set('models', sequelize.models)
+const { Op } = require('sequelize');  // Import Op directly from sequelize
 
 /**
  * FIX ME!
@@ -14,12 +16,14 @@ app.set('models', sequelize.models)
 app.get('/contracts/:id', getProfile, async (req, res) => {
     const { Contract } = req.app.get('models');
     const { id } = req.params;
-    const profileId = req.profile.id;
 
     const contract = await Contract.findOne({
         where: {
+            [Op.or]: [
+                { ContractorId: req.profile.id },
+                { ClientId: req.profile.id }
+            ],
             id,
-            profileId
         }
     });
 
@@ -30,6 +34,7 @@ app.get('/contracts/:id', getProfile, async (req, res) => {
 
 app.get('/contracts', getProfile, async (req, res) => {
     const { Contract } = req.app.get('models');
+    console.log(Contract)
     const contract = await Contract.findAll({
         where: {
             [Op.or]: [
@@ -48,9 +53,12 @@ app.get('/contracts', getProfile, async (req, res) => {
 });
 
 app.get('/jobs/unpaid', getProfile, async (req, res) => {
-    const jobs = await sequelize.models.Job.findAll({
+    const { Job } = req.app.get('models');
+    const { Contract } = req.app.get('models');
+
+    const jobs = await Job.findAll({
         include: {
-            model: sequelize.models.Contract,
+            model: Contract,
             where: {
                 [Op.or]: [
                     { ContractorId: req.profile.id },
@@ -72,11 +80,13 @@ app.get('/jobs/unpaid', getProfile, async (req, res) => {
 app.post('/jobs/:job_id/pay', getProfile, async (req, res) => {
     const { job_id } = req.params;
     const transaction = await sequelize.transaction();
+    const { Job } = req.app.get('models');
+    const { Contract } = req.app.get('models');
 
     try {
-        const job = await sequelize.models.Job.findOne({
+        const job = await Job.findOne({
             include: {
-                model: sequelize.models.Contract,
+                model: Contract,
                 where: { ClientId: req.profile.id },
                 required: true
             },
@@ -126,12 +136,16 @@ app.post('/balances/deposit/:userId', getProfile, async (req, res) => {
     const { userId } = req.params;
     const { amount } = req.body;
     const transaction = await sequelize.transaction();
-
+    const { Job } = req.app.get('models');
+    const { Contract } = req.app.get('models');
+    if(amount < 0 ) {
+        return res.status(400).json({ error: 'Insufficient amount' })
+    }
     try {
-        // Calculate total jobs to pay
-        const totalJobsToPay = await sequelize.models.Job.sum('price', {
+
+        const totalJobsToPay = await Job.sum('price', {
             include: {
-                model: sequelize.models.Contract,
+                model: Contract,
                 where: {
                     ClientId: userId,
                     status: 'in_progress'
@@ -171,51 +185,63 @@ app.post('/balances/deposit/:userId', getProfile, async (req, res) => {
 });
 
 
-app.get('/admin/best-profession', async (req, res) => {
-    const { start, end } = req.query;
+app.get('/admin/best-profession', validateDateRange, async (req, res) => {
+    try {
+        const {Job} = req.app.get('models');
+        const {Contract} = req.app.get('models');
+        const {Profile} = req.app.get('models');
 
-    const result = await sequelize.models.Job.findOne({
-        attributes: [
-            [sequelize.col('Contract.Contractor.profession'), 'profession'],
-            [sequelize.fn('SUM', sequelize.col('price')), 'earned']
-        ],
-        include: [{
-            model: sequelize.models.Contract,
+        const {start, end} = req.query;
+        const result = await Job.findOne({
+            attributes: [
+                [sequelize.col('Contract.Contractor.profession'), 'profession'],
+                [sequelize.fn('SUM', sequelize.col('price')), 'earned']
+            ],
             include: [{
-                model: sequelize.models.Profile,
-                as: 'Contractor',
-                attributes: ['profession']
-            }]
-        }],
-        where: {
-            paid: true,
-            paymentDate: {
-                [Op.between]: [start, end]
-            }
-        },
-        group: ['Contract.Contractor.profession'],
-        order: [[sequelize.fn('SUM', sequelize.col('price')), 'DESC']],
-        raw: true
-    });
+                model: Contract,
+                include: [{
+                    model: Profile,
+                    as: 'Contractor',
+                    attributes: ['profession']
+                }]
+            }],
+            where: {
+                paid: true,
+                paymentDate: {
+                    [Op.between]: [start, end]
+                }
+            },
+            group: ['Contract.Contractor.profession'],
+            order: [[sequelize.fn('SUM', sequelize.col('price')), 'DESC']],
+            raw: true
+        });
 
-    res.json({ profession: result?.profession });
+        res.json({profession: result?.profession});
+    } catch (error)
+    {
+        res.status(500).json({error: 'Error processing date range query'});
+    }
 });
 
-app.get('/admin/best-clients', async (req, res) => {
+app.get('/admin/best-clients', validateDateRange,async (req, res) => {
     const { start, end, limit = 2 } = req.query;
 
-    const clients = await sequelize.models.Job.findAll({
+    const jobs = await sequelize.models.Job.findAll({
         attributes: [
-            [sequelize.col('Contract.Client.id'), 'id'],
-            [sequelize.literal("Contract.Client.firstName || ' ' || Contract.Client.lastName"), 'fullName'],
-            [sequelize.fn('SUM', sequelize.col('price')), 'paid']
+            'Contract.Client.id',
+            [sequelize.fn('SUM', sequelize.col('price')), 'paid'],
+            [sequelize.col('Contract.Client.firstName'), 'firstName'],
+            [sequelize.col('Contract.Client.lastName'), 'lastName']
         ],
         include: [{
             model: sequelize.models.Contract,
+            required: true,
+            attributes: [],
             include: [{
                 model: sequelize.models.Profile,
                 as: 'Client',
-                attributes: ['firstName', 'lastName']
+                required: true,
+                attributes: []
             }]
         }],
         where: {
@@ -224,18 +250,23 @@ app.get('/admin/best-clients', async (req, res) => {
                 [Op.between]: [start, end]
             }
         },
-        group: ['Contract.Client.id'],
+        group: [
+            'Contract.Client.id',
+            'Contract.Client.firstName',
+            'Contract.Client.lastName'
+        ],
         order: [[sequelize.fn('SUM', sequelize.col('price')), 'DESC']],
         limit: parseInt(limit),
         raw: true
     });
 
-    const formattedClients = clients.map(client => ({
-        id: client.id,
-        fullName: client.fullName,
-        paid: parseFloat(client.paid)
+    const formattedClients = jobs.map(job => ({
+        id: job.id,
+        fullName: `${job.firstName} ${job.lastName}`,
+        paid: parseFloat(job.paid)
     }));
 
     res.json(formattedClients);
 });
+
 module.exports = app;
